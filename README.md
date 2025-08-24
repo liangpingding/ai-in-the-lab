@@ -26,6 +26,7 @@ Python 3.11, transformers v4.37.2, openai v1.98.0
 
 ![fig1](docs/Figure1_AI_mode_over_years_number.png)
 
+
 - Fig. 2. Scientific publications by AI mode, classified by foundational, adaptation, tool, and discussion modes for 20 leading counties by all AI publications
 ![fig2](docs/Figure2_AI_mode_across_countries.png)  
 

@@ -20,7 +20,7 @@ result_file_name = "Data/batch_job_results.jsonl"
 # Load the dataset
 df = pd.read_csv(dataset_path)
 df.head()
-OPENAI_KEY = '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'
+OPENAI_KEY = ''
 client = OpenAI(api_key=OPENAI_KEY)  # Initialize the OpenAI client
 #%%
 categorize_system_prompt =  """
@@ -98,8 +98,8 @@ batch_job = client.batches.create(
 #-------------------------
 # STEP 3: Read the results
 #--------------------------
-batch_job=client.batches.retrieve("batch_689088c9aab08190a576f2458cafb98f")
-# batch_job = client.batches.retrieve(batch_job.id)
+
+batch_job = client.batches.retrieve(batch_job.id)
 print("job id: {}".format(batch_job))
 result_file_id = batch_job.output_file_id
 result = client.files.content(result_file_id).content
@@ -127,28 +127,4 @@ for res in results:
     print(f"OVERVIEW: {description}\n\nRESULT: {result}")
     print("\n\n----------------------------\n\n")
 df.to_csv('Data/human_annotation.csv',index=False)
-# Save
-#%%
-#-------------------------
-# STEP 4: Further process
-#--------------------------
-if os.path.exists(result_file_name):
-    os.remove(result_file_name)
-    print("文件已删除")
-else:
-    print("文件不存在")
-
-if os.path.exists(json_file_name):
-    os.remove(json_file_name)
-    print("文件已删除")
-else:
-    print("文件不存在")
-
-
-#%%
-#-------------------------
-# Check the results
-#--------------------------
-
-pd.crosstab(df['AI_revelance_keywords'], df['AI_relevance_GPT'], margins=True, margins_name="Total")
 
