@@ -26,12 +26,19 @@ import pandas as pd
 import datasets
 import evaluate
 import numpy as np
+import wandb
 import torch
 import torch.nn.functional as F
 from datasets import Value, load_dataset
 from datasets import DatasetDict
 from datasets import Dataset
 import transformers
+import json
+import pprint
+from sklearn.metrics import f1_score, precision_score, recall_score
+
+from transformers import TrainerCallback
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"   # 只让程序看到 GPU0
 from transformers import (
     AutoConfig,
     AutoModelForSequenceClassification,
@@ -43,15 +50,50 @@ from transformers import (
     TrainingArguments,
     default_data_collator,
     set_seed,
+    EarlyStoppingCallback
 )
 from transformers.trainer_utils import get_last_checkpoint
 from transformers.utils import check_min_version, send_example_telemetry
 from transformers.utils.versions import require_version
 
 
-
-
 logger = logging.getLogger(__name__)
+from sklearn.metrics import f1_score
+
+
+if torch.cuda.is_available():
+    print(f" GPU count: {torch.cuda.device_count()}")
+    for i in range(torch.cuda.device_count()):
+        print(f"GPU {i}: {torch.cuda.get_device_name(i)}")
+else:
+    print("No GPU")
+    
+def compute_metrics(eval_pred):
+    logits, labels = eval_pred
+    preds = logits.argmax(axis=-1)
+    f1 = f1_score(labels, preds, average="macro")  
+    precision = precision_score(labels, preds, average="macro")
+    recall = recall_score(labels, preds, average="macro")
+
+    return {
+        "f1": f1,
+        "precision": precision,
+        "recall": recall,
+    }
+
+class UnfreezeCallback(TrainerCallback):
+    def __init__(self, unfreeze_epoch):  
+        self.unfreeze_epoch =unfreeze_epoch
+        self.already_unfrozen = False
+
+    def on_epoch_begin(self, args, state, control, **kwargs):
+        if state.epoch >= self.unfreeze_epoch and not self.already_unfrozen:
+            model = kwargs["model"]
+            for name, param in model.bert.named_parameters():
+                if "encoder.layer.10" in name or "encoder.layer.11" in name or "encoder.layer.9" in name or "encoder.layer.8" in name:
+                    param.requires_grad = True
+            self.already_unfrozen = True
+        return control
 
 
 @dataclass
@@ -63,7 +105,10 @@ class DataTrainingArguments:
     into argparse arguments to be able to specify them on
     the command line.
     """
-
+    freeze_bert: bool = field(default=False, metadata={"help": "Whether to freeze bert parameters."})
+    unfreeze_epoch: int = field(default=2, metadata={"help": "The epoch to unfreeze bert parameters."})
+    early_stopping_patience: int = field(default=5, metadata={"help": "The patience to wait before early stopping."})
+    nolabel_test: bool = field(default=False, metadata={"help": "Whether the test dataset has no labels."})
     dataset_name: Optional[str] = field(
         default=None, metadata={"help": "The name of the dataset to use (via the datasets library)."}
     )
@@ -190,7 +235,12 @@ class DataTrainingArguments:
     )
     test_file: Optional[str] = field(default=None, metadata={"help": "A csv or a json file containing the test data."})
 
-
+@dataclass
+class wandbArguments:
+    """Aruguments for wandb logging"""
+    sweep_method: str = field(default='None')
+    sweep_file: str = field(default='None')
+    project_name: str = field(default='None')
 
 @dataclass
 class ModelArguments:
@@ -258,34 +308,87 @@ def get_label_list(raw_dataset, split="train") -> List[str]:
     return label_list
 
 
+def wandb_train(num_labels,train_dataset,eval_dataset,model_args, data_args, training_args, wandb_args):
+    with wandb.init():
+        wandbconfig = wandb.config
+        print("wandb config:------------------\n\n")
+        print(wandbconfig)
+        args = training_args
+        args.learning_rate = wandbconfig.learning_rate
+        args.num_train_epochs = wandbconfig.num_train_epochs
+
+        set_seed(args.seed)
+        # print("Seed value:", args.seed, type(args.seed))
+        config = AutoConfig.from_pretrained(
+            model_args.config_name if model_args.config_name else model_args.model_name_or_path,
+            num_labels=num_labels,
+            finetuning_task="text-classification",
+            cache_dir=model_args.cache_dir,
+            revision=model_args.model_revision,
+            token=model_args.token,
+            trust_remote_code=model_args.trust_remote_code,
+        )
+
+        tokenizer = AutoTokenizer.from_pretrained(
+            model_args.tokenizer_name if model_args.tokenizer_name else model_args.model_name_or_path,
+            cache_dir=model_args.cache_dir,
+            use_fast=model_args.use_fast_tokenizer,
+            revision=model_args.model_revision,
+            token=model_args.token,
+            trust_remote_code=model_args.trust_remote_code,
+        )
+
+
+        model = AutoModelForSequenceClassification.from_pretrained(
+        model_args.model_name_or_path,
+        from_tf=bool(".ckpt" in model_args.model_name_or_path),
+        config=config,
+        cache_dir=model_args.cache_dir,
+        revision=model_args.model_revision,
+        token=model_args.token,
+        trust_remote_code=model_args.trust_remote_code,
+        ignore_mismatched_sizes=model_args.ignore_mismatched_sizes,
+        )
+        tokenizer = AutoTokenizer.from_pretrained(
+        model_args.tokenizer_name if model_args.tokenizer_name else model_args.model_name_or_path,
+        cache_dir=model_args.cache_dir,
+        use_fast=model_args.use_fast_tokenizer,
+        revision=model_args.model_revision,
+        token=model_args.token,
+        trust_remote_code=model_args.trust_remote_code,
+        )
+        trainer = Trainer(
+            model=model,
+            args=args,
+            train_dataset=train_dataset if training_args.do_train else None,
+            eval_dataset=eval_dataset if training_args.do_eval else None,
+            tokenizer=tokenizer,
+            compute_metrics=compute_metrics,
+            callbacks=[EarlyStoppingCallback(early_stopping_patience=data_args.early_stopping_patience)]
+            )            
+        trainer.train()
+        set_seed(training_args.seed)
+        trainer.evaluate()
+
+
 def main():
-    # See all possible arguments in src/transformers/training_args.py
-    # or by passing the --help flag to this script.
-    # We now keep distinct sets of args, for a cleaner separation of concerns.
+    parser = HfArgumentParser((ModelArguments, DataTrainingArguments, TrainingArguments,wandbArguments))
 
-    parser = HfArgumentParser((ModelArguments, DataTrainingArguments, TrainingArguments))
-    if len(sys.argv) == 2 and sys.argv[1].endswith(".json"):
-        # If we pass only one argument to the script and it's the path to a json file,
-        # let's parse it to get our arguments.
-        model_args, data_args, training_args = parser.parse_json_file(json_file=os.path.abspath(sys.argv[1]))
-    else:
-        model_args, data_args, training_args = parser.parse_args_into_dataclasses()
-
-    # Sending telemetry. Tracking the example usage helps us better allocate resources to maintain them. The
-    # information sent is the one passed as arguments along with your Python/PyTorch versions.
+    
+    model_args, data_args, training_args, wandb_args = parser.parse_args_into_dataclasses()
+    
     send_example_telemetry("run_classification", model_args, data_args)
 
-    # Setup logging
+    set_seed(training_args.seed)
+    ######################### Setup logging########################################
     logging.basicConfig(
         format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
         datefmt="%m/%d/%Y %H:%M:%S",
         handlers=[logging.StreamHandler(sys.stdout)],
     )
-
     if training_args.should_log:
         # The default of training_args.log_level is passive, so we set log level at info here to have that default.
         transformers.utils.logging.set_verbosity_info()
-
     log_level = training_args.get_process_log_level()
     logger.setLevel(log_level)
     datasets.utils.logging.set_verbosity(log_level)
@@ -293,52 +396,16 @@ def main():
     transformers.utils.logging.enable_default_handler()
     transformers.utils.logging.enable_explicit_format()
 
-    # Log on each process the small summary:
     logger.warning(
         f"Process rank: {training_args.local_rank}, device: {training_args.device}, n_gpu: {training_args.n_gpu}, "
         + f"distributed training: {training_args.parallel_mode.value == 'distributed'}, 16-bits training: {training_args.fp16}"
     )
     logger.info(f"Training/evaluation parameters {training_args}")
 
-    # Detecting last checkpoint.
-    last_checkpoint = None
-    if os.path.isdir(training_args.output_dir) and training_args.do_train and not training_args.overwrite_output_dir:
-        last_checkpoint = get_last_checkpoint(training_args.output_dir)
-        if last_checkpoint is None and len(os.listdir(training_args.output_dir)) > 0:
-            raise ValueError(
-                f"Output directory ({training_args.output_dir}) already exists and is not empty. "
-                "Use --overwrite_output_dir to overcome."
-            )
-        elif last_checkpoint is not None and training_args.resume_from_checkpoint is None:
-            logger.info(
-                f"Checkpoint detected, resuming training at {last_checkpoint}. To avoid this behavior, change "
-                "the `--output_dir` or add `--overwrite_output_dir` to train from scratch."
-            )
 
-    # Set seed before initializing model.
-    set_seed(training_args.seed)
-
-    # Get the datasets: you can either provide your own CSV/JSON training and evaluation files, or specify a dataset name
-    # to load from huggingface/datasets. In ether case, you can specify a the key of the column(s) containing the text and
-    # the key of the column containing the label. If multiple columns are specified for the text, they will be joined together
-    # for the actual text value.
-    # In distributed training, the load_dataset function guarantee that only one local process can concurrently
-    # download the dataset.
-    if data_args.dataset_name is not None:
-        # Downloading and loading a dataset from the hub.
-        raw_datasets = load_dataset(
-            data_args.dataset_name,
-            data_args.dataset_config_name,
-            cache_dir=model_args.cache_dir,
-            token=model_args.token,
-            trust_remote_code=model_args.trust_remote_code,
-        )
-        # Try print some info about the dataset
-        logger.info(f"Dataset loaded: {raw_datasets}")
-        logger.info(raw_datasets)
-    else:
-
-        if data_args.train_file.endswith(".csv"):
+ 
+    ######################### process dataset ########################################
+    if data_args.train_file.endswith(".csv"):
             print(data_args.train_file)
             train_df = pd.read_csv(data_args.train_file, usecols=[data_args.text_column_names, data_args.label_column_name])
             train_dataset = Dataset.from_pandas(train_df)
@@ -346,13 +413,14 @@ def main():
                 eval_df = pd.read_csv(data_args.validation_file, usecols=[data_args.text_column_names, data_args.label_column_name])
                 eval_dataset = Dataset.from_pandas(eval_df)
             if training_args.do_predict:
-                predict_df = pd.read_csv(data_args.test_file, usecols=[data_args.text_column_names])
-                predict_df[data_args.label_column_name]='-1'
+                
+                if data_args.nolabel_test:
+                    predict_df = pd.read_csv(data_args.test_file, usecols=[data_args.text_column_names])
+                    predict_df[data_args.label_column_name]=-1
+                else:
+                    predict_df = pd.read_csv(data_args.test_file, usecols=[data_args.text_column_names, data_args.label_column_name])
                 predict_dataset = Dataset.from_pandas(predict_df)
 
-
-    # See more about loading any type of standard or custom dataset at
-    # https://huggingface.co/docs/datasets/loading_datasets.
     raw_datasets = DatasetDict()   
     if train_dataset is not None:
         raw_datasets["train"] = train_dataset
@@ -360,31 +428,10 @@ def main():
         raw_datasets["validation"] = eval_dataset
     if training_args.do_predict and predict_dataset is not None:
         raw_datasets["test"] = predict_dataset
-
-
-    if data_args.remove_columns is not None:
-        for split in raw_datasets.keys():
-            for column in data_args.remove_columns.split(","):
-                logger.info(f"removing column {column} from split {split}")
-                raw_datasets[split] = raw_datasets[split].remove_columns(column)
-
+   
     if data_args.label_column_name is not None and data_args.label_column_name != "label":
         for key in raw_datasets.keys():
             raw_datasets[key] = raw_datasets[key].rename_column(data_args.label_column_name, "label")
-
-    # Trying to have good defaults here, don't hesitate to tweak to your needs.
-
-    is_regression = (
-        raw_datasets["train"].features["label"].dtype in ["float32", "float64"]
-        if data_args.do_regression is None
-        else data_args.do_regression
-    )
-
-    is_multi_label = False
-
-    if raw_datasets["train"].features["label"].dtype == "list":  # multi-label classification
-        is_multi_label = True
-        logger.info("Label type is list, doing multi-label classification")
 
     label_list = get_label_list(raw_datasets, split="train")
     # if label is -1, we throw a warning and remove it from the label list
@@ -395,12 +442,12 @@ def main():
 
     label_list.sort()
     num_labels = len(label_list)
-    if num_labels <= 1:
-            raise ValueError("You need more than one label to do classification.")
+    label_to_id = {v: i for i, v in enumerate(label_list)}
+    print("label_to_id--------------------------------\n")
+    print(label_to_id)
 
-    # Load pretrained model and tokenizer
-    # In distributed training, the .from_pretrained methods guarantee that only one local process can concurrently
-    # download model & vocab.
+   ######################### Load model config and tokenizer ########################################
+    set_seed(training_args.seed)
     config = AutoConfig.from_pretrained(
         model_args.config_name if model_args.config_name else model_args.model_name_or_path,
         num_labels=num_labels,
@@ -410,16 +457,6 @@ def main():
         token=model_args.token,
         trust_remote_code=model_args.trust_remote_code,
     )
-
-    if is_regression:
-        config.problem_type = "regression"
-        logger.info("setting problem type to regression")
-    elif is_multi_label:
-        config.problem_type = "multi_label_classification"
-        logger.info("setting problem type to multi label classification")
-    else:
-        config.problem_type = "single_label_classification"
-        logger.info("setting problem type to single label classification")
 
     tokenizer = AutoTokenizer.from_pretrained(
         model_args.tokenizer_name if model_args.tokenizer_name else model_args.model_name_or_path,
@@ -439,46 +476,17 @@ def main():
         trust_remote_code=model_args.trust_remote_code,
         ignore_mismatched_sizes=model_args.ignore_mismatched_sizes,
     )
-
-    # Padding strategy
-    if data_args.pad_to_max_length:
-        padding = "max_length"
-    else:
-        # We will pad later, dynamically at batch creation, to the max sequence length in each batch
-        padding = False
-
-    # for training ,we will update the config with label infos,
-    # if do_train is not set, we will use the label infos in the config
-    if training_args.do_train and not is_regression:  # classification, training
-        label_to_id = {v: i for i, v in enumerate(label_list)}
-        # update config with label infos
-        if model.config.label2id != label_to_id:
-            logger.warning(
-                "The label2id key in the model config.json is not equal to the label2id key of this "
-                "run. You can ignore this if you are doing finetuning."
-            )
-        model.config.label2id = label_to_id
-        model.config.id2label = {id: label for label, id in label_to_id.items()}
-    elif not is_regression:  # classification, but not training
-        logger.info("using label infos in the model config")
-        logger.info("label2id: {}".format(model.config.label2id))
-        label_to_id = model.config.label2id
-    else:  # regression
-        label_to_id = None
-
-    if data_args.max_seq_length > tokenizer.model_max_length:
-        logger.warning(
-            f"The max_seq_length passed ({data_args.max_seq_length}) is larger than the maximum length for the "
-            f"model ({tokenizer.model_max_length}). Using max_seq_length={tokenizer.model_max_length}."
-        )
-    max_seq_length = min(data_args.max_seq_length, tokenizer.model_max_length)
-
-    def multi_labels_to_ids(labels: List[str]) -> List[float]:
-        ids = [0.0] * len(label_to_id)  # BCELoss requires float as target type
-        for label in labels:
-            ids[label_to_id[label]] = 1.0
-        return ids
-
+    if data_args.freeze_bert:
+        print('freeze bert parameters')
+        for param in model.bert.parameters():
+            param.requires_grad = False
+        # for name, param in model.bert.named_parameters():
+        #     if name.startswith("embeddings") or name.startswith("encoder.layer.0") or \
+        #     name.startswith("encoder.layer.1") or name.startswith("encoder.layer.2") or \
+        #     name.startswith("encoder.layer.3") or name.startswith("encoder.layer.4") or \
+        #     name.startswith("encoder.layer.5") or name.startswith("encoder.layer.6") or \
+        #     name.startswith("encoder.layer.7") or name.startswith("encoder.layer.8") :
+        #         param.requires_grad = False
     def preprocess_function(examples):
         if data_args.text_column_names is not None:
             text_column_names = data_args.text_column_names.split(",")
@@ -488,10 +496,10 @@ def main():
                 for i in range(len(examples[column])):
                     examples["sentence"][i] += data_args.text_column_delimiter + examples[column][i]
         # Tokenize the texts
-        result = tokenizer(examples["sentence"], padding=padding, max_length=max_seq_length, truncation=True)
+        result = tokenizer(examples["sentence"], padding="max_length", max_length=data_args.max_seq_length, truncation=True)
         # print('the output of {}'.format(label_to_id))
-        if label_to_id is not None and training_args.do_train:
-                result["label"] = [label_to_id[str(l)] if l is not None and l != '-1' else -1 for l in examples["label"]]
+        if label_to_id is not None and (training_args.do_train or training_args.do_eval):
+                result["label"] = [label_to_id[str(l)] if l is not None and l != -1 else -1 for l in examples["label"]]
         return result
 
     # Running the preprocessing pipeline on all the datasets
@@ -504,6 +512,7 @@ def main():
             desc="Running tokenizer on dataset",
         )
 
+
     if training_args.do_train:
         if "train" not in raw_datasets:
             raise ValueError("--do_train requires a train dataset.")
@@ -511,155 +520,120 @@ def main():
         if data_args.shuffle_train_dataset:
             logger.info("Shuffling the training dataset")
             train_dataset = train_dataset.shuffle(seed=data_args.shuffle_seed)
-        if data_args.max_train_samples is not None:
-            max_train_samples = min(len(train_dataset), data_args.max_train_samples)
-            train_dataset = train_dataset.select(range(max_train_samples))
-
+        for index in range(len(train_dataset)):
+            if index<=3:
+                logger.info(f"Sample {index} of the training set: {train_dataset[index]}.")
     if training_args.do_eval:
-        if "validation" not in raw_datasets and "validation_matched" not in raw_datasets:
-            if "test" not in raw_datasets and "test_matched" not in raw_datasets:
-                raise ValueError("--do_eval requires a validation or test dataset if validation is not defined.")
-            else:
-                logger.warning("Validation dataset not found. Falling back to test dataset for validation.")
-                eval_dataset = raw_datasets["test"]
+        if "validation" not in raw_datasets:
+            raise ValueError("--do_eval requires a validation or test dataset if validation is not defined.")
         else:
             eval_dataset = raw_datasets["validation"]
 
-        if data_args.max_eval_samples is not None:
-            max_eval_samples = min(len(eval_dataset), data_args.max_eval_samples)
-            eval_dataset = eval_dataset.select(range(max_eval_samples))
-
-    if training_args.do_predict or data_args.test_file is not None:
+    if training_args.do_predict:
         if "test" not in raw_datasets:
             raise ValueError("--do_predict requires a test dataset")
         predict_dataset = raw_datasets["test"]
-        # remove label column if it exists
-        if data_args.max_predict_samples is not None:
-            max_predict_samples = min(len(predict_dataset), data_args.max_predict_samples)
-            predict_dataset = predict_dataset.select(range(max_predict_samples))
 
-    # Log a few random samples from the training set:
-    if training_args.do_train:
-        for index in random.sample(range(len(train_dataset)), 3):
-            logger.info(f"Sample {index} of the training set: {train_dataset[index]}.")
 
-    if data_args.metric_name is not None:
-        # Load metrics based on `metric_name` argument
-        # Load metrics based on `metric_name` argument
-        metric = (
-            evaluate.load(data_args.metric_name, config_name="multilabel", cache_dir=model_args.cache_dir)
-            if is_multi_label
-            else evaluate.load(data_args.metric_name, cache_dir=model_args.cache_dir)
-        )
-        logger.info(f"Using metric {data_args.metric_name} for evaluation.")
-
-    def compute_metrics(p: EvalPrediction):
-        preds = p.predictions[0] if isinstance(p.predictions, tuple) else p.predictions
-        if is_regression:
-            preds = np.squeeze(preds)
-            result = metric.compute(predictions=preds, references=p.label_ids)
-        elif is_multi_label:
-            preds = np.array([np.where(p > 0, 1, 0) for p in preds])  # convert logits to multi-hot encoding
-            # Micro F1 is commonly used in multi-label classification
-            result = metric.compute(predictions=preds, references=p.label_ids, average="micro")
+    ###########################tune model parameters or train/test model####################
+    if wandb_args.sweep_method=="grid":  
+            with open(wandb_args.sweep_file) as f:
+                    sweep_config = json.load(f)
+            pprint.pprint(sweep_config)
+            sweep_id=wandb.sweep(sweep_config,project=wandb_args.project_name)
+            set_seed(training_args.seed)
+            # import ipdb; ipdb.set_trace()
+            wandb.agent(sweep_id,lambda: wandb_train(num_labels,train_dataset,eval_dataset,model_args, data_args, training_args, wandb_args))
+            set_seed(training_args.seed)
+    else:
+        # Initialize our Trainer
+        set_seed(training_args.seed)
+        if data_args.freeze_bert:
+            trainer = Trainer(
+                model=model,
+                args=training_args,
+                train_dataset=train_dataset if training_args.do_train else None,
+                eval_dataset=eval_dataset if training_args.do_eval else None,
+                tokenizer=tokenizer,
+                compute_metrics=compute_metrics,
+                callbacks=[EarlyStoppingCallback(early_stopping_patience=data_args.early_stopping_patience),UnfreezeCallback(data_args.unfreeze_epoch)]
+            )
         else:
-            preds = np.argmax(preds, axis=1)
-            result = metric.compute(predictions=preds, references=p.label_ids,average="micro")
-        if len(result) > 1:
-            result["combined_score"] = np.mean(list(result.values())).item()
-        return result
+            trainer = Trainer(
+                model=model,
+                args=training_args,
+                train_dataset=train_dataset if training_args.do_train else None,
+                eval_dataset=eval_dataset if training_args.do_eval else None,
+                tokenizer=tokenizer,
+                compute_metrics=compute_metrics,
+                callbacks=[EarlyStoppingCallback(early_stopping_patience=data_args.early_stopping_patience)]
+            )
+        # Training
+        if training_args.do_train:
+            train_result = trainer.train()
+            metrics = train_result.metrics
+            max_train_samples = (
+                data_args.max_train_samples if data_args.max_train_samples is not None else len(train_dataset)
+            )
+            metrics["train_samples"] = min(max_train_samples, len(train_dataset))
+            trainer.save_model()  # Saves the tokenizer too for easy upload
+            trainer.log_metrics("train", metrics)
+            trainer.save_metrics("train", metrics)
+            trainer.save_state()
+            set_seed(training_args.seed)
+        # Evaluation
+        if training_args.do_eval:
+            logger.info("*** Evaluate ***")
+            metrics = trainer.evaluate(eval_dataset=eval_dataset)
+            max_eval_samples = data_args.max_eval_samples if data_args.max_eval_samples is not None else len(eval_dataset)
+            metrics["eval_samples"] = min(max_eval_samples, len(eval_dataset))
+            trainer.log_metrics("eval", metrics)
+            trainer.save_metrics("eval", metrics)
 
-    # Data collator will default to DataCollatorWithPadding when the tokenizer is passed to Trainer, so we change it if
-    # we already did the padding.
-    if data_args.pad_to_max_length:
-        data_collator = default_data_collator
-    elif training_args.fp16:
-        data_collator = DataCollatorWithPadding(tokenizer, pad_to_multiple_of=8)
-    else:
-        data_collator = None
-
-    # Initialize our Trainer
-    trainer = Trainer(
-        model=model,
-        args=training_args,
-        train_dataset=train_dataset if training_args.do_train else None,
-        eval_dataset=eval_dataset if training_args.do_eval else None,
-        compute_metrics=compute_metrics,
-        tokenizer=tokenizer,
-        data_collator=data_collator,
-    )
-
-    # Training
-    if training_args.do_train:
-        checkpoint = None
-        if training_args.resume_from_checkpoint is not None:
-            checkpoint = training_args.resume_from_checkpoint
-        elif last_checkpoint is not None:
-            checkpoint = last_checkpoint
-        train_result = trainer.train(resume_from_checkpoint=checkpoint)
-        metrics = train_result.metrics
-        max_train_samples = (
-            data_args.max_train_samples if data_args.max_train_samples is not None else len(train_dataset)
-        )
-        metrics["train_samples"] = min(max_train_samples, len(train_dataset))
-        trainer.save_model()  # Saves the tokenizer too for easy upload
-        trainer.log_metrics("train", metrics)
-        trainer.save_metrics("train", metrics)
-        trainer.save_state()
-
-    # Evaluation
-    if training_args.do_eval:
-        logger.info("*** Evaluate ***")
-        metrics = trainer.evaluate(eval_dataset=eval_dataset)
-        max_eval_samples = data_args.max_eval_samples if data_args.max_eval_samples is not None else len(eval_dataset)
-        metrics["eval_samples"] = min(max_eval_samples, len(eval_dataset))
-        trainer.log_metrics("eval", metrics)
-        trainer.save_metrics("eval", metrics)
-
-    if training_args.do_predict:
-        logger.info("*** Predict ***")
-        # Removing the `label` columns if exists because it might contains -1 and Trainer won't like that.
-        if "label" in predict_dataset.features:
-            predict_dataset = predict_dataset.remove_columns("label")
-        predictions = trainer.predict(predict_dataset, metric_key_prefix="predict").predictions
-        logits = predictions  
-        probs = F.softmax(torch.tensor(logits), dim=1).numpy()  # shape: [N, C]
-        predicted_indices = np.argmax(probs, axis=1)
-        confidence_scores = np.max(probs, axis=1)
-        # predictions = np.argmax(predictions, axis=1)
-        # output_predict_file = os.path.join(training_args.output_dir, "predict_results.csv")
-
-        rows = []
-        for i, (pred_idx, conf, prob_row) in enumerate(zip(predicted_indices, confidence_scores, probs)):
-            row = {
-                "index": i,
-                "prediction": label_list[pred_idx],
-                "confidence": conf
-            }
-
-            for j, label in enumerate(label_list):
-                row[f"prob_{label}"] = prob_row[j]
-            rows.append(row)
-
-        df = pd.DataFrame(rows)
-        output_csv_file = os.path.join(training_args.output_dir, "predict_probs.csv")
-        df.to_csv(output_csv_file, index=False)
- 
-        logger.info("Predict results saved at {}".format(output_csv_file))
-    kwargs = {"finetuned_from": model_args.model_name_or_path, "tasks": "text-classification"}
-
-    if training_args.push_to_hub:
-        trainer.push_to_hub(**kwargs)
-    else:
-        trainer.create_model_card(**kwargs)
+        if training_args.do_predict:
+            logger.info("*** Predict ***")
+            # Removing the `label` columns if exists because it might contains -1 and Trainer won't like that.
+            if not data_args.nolabel_test:
+                pred_output = trainer.predict(test_dataset=predict_dataset)
+                metrics = dict(pred_output.metrics)  
+                metrics["test_samples"] = len(predict_dataset)
+                wandb.log(metrics)
+                trainer.log_metrics("test", metrics)
+                trainer.save_metrics("test", metrics)
+            if "label" in predict_dataset.features:
+                predict_dataset = predict_dataset.remove_columns("label")
+            predictions = trainer.predict(predict_dataset, metric_key_prefix="predict").predictions
+            logits = predictions  
+            probs = F.softmax(torch.tensor(logits), dim=1).numpy()  # shape: [N, C]
+            predicted_indices = np.argmax(probs, axis=1)
+            confidence_scores = np.max(probs, axis=1)
 
 
-def _mp_fn(index):
+            rows = []
+            for i, (pred_idx, conf, prob_row) in enumerate(zip(predicted_indices, confidence_scores, probs)):
+                row = {
+                    "index": i,
+                    "prediction": label_list[pred_idx],
+                    "confidence": conf
+                }
 
-    main()
+                for j, label in enumerate(label_list):
+                    row[f"prob_{label}"] = prob_row[j]
+                rows.append(row)
+
+            df = pd.DataFrame(rows)
+            output_csv_file = os.path.join(training_args.output_dir, "predict_probs.csv")
+            df.to_csv(output_csv_file, index=False)
+
+            logger.info("Predict results saved at {}".format(output_csv_file))
+        kwargs = {"finetuned_from": model_args.model_name_or_path, "tasks": "text-classification"}
+
+
+
 
 
 
 if __name__ == "__main__":
+    wandb.login(key="")
     main()
 
